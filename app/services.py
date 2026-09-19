@@ -9,9 +9,10 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from . import segmentation as seg
+from . import timeline as tl
 from .config import settings
 from .database import Anchor, CaseState, Reading, SegmentSnapshot, to_utc, utcnow
-from .schemas import AnchorIn, ReadingIn, SegmentOut, SegmentationOut
+from .schemas import AnchorIn, ReadingIn, SegmentOut, SegmentationOut, TimelineOut, TimelinePointOut
 
 
 # ---------- 读取 / 序列化 ----------
@@ -333,6 +334,115 @@ def delete_anchor(db: Session, device_sn: str, ts: dt.datetime) -> bool:
 
 def list_cases(db: Session) -> list[CaseState]:
     return list(db.scalars(select(CaseState).order_by(CaseState.device_sn.asc())).all())
+
+
+# ---------- 时间线降采样 ----------
+
+
+def get_effective_segmentation(db: Session, device_sn: str) -> SegmentationOut | None:
+    """已落库的分段快照；展柜尚未重放时有读数则即时计算（只读，不落库）。"""
+    stored = get_stored_segmentation(db, device_sn)
+    if stored is not None:
+        return stored
+    samples = _load_samples(db, device_sn)
+    if not samples:
+        return None
+    anchors = _load_anchor_ts(db, device_sn)
+    result = seg.segment_samples(device_sn, samples, anchors)
+    return serialize_result(result, version=0, replayed=False, replayed_at=None)
+
+
+def build_case_timeline(
+    db: Session,
+    device_sn: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    max_points: int,
+) -> TimelineOut | None:
+    """过滤后对温湿度时间线执行“强制点 + 比例配额 + 确定性 LTTB”。
+
+    设备没有任何读数时返回 ``None``（由上层判 404）；有读数但过滤后
+    为空范围时返回空时间线。极值统计与名额预算均只基于过滤后范围；
+    强制点去重后超过 ``max_points`` 时抛
+    :class:`timeline.ForcedPointsOverflow`。
+    """
+    all_samples = _load_samples(db, device_sn)
+    if not all_samples:
+        return None
+    samples = all_samples
+    if start is not None:
+        samples = [s for s in samples if s.ts >= start]
+    if end is not None:
+        samples = [s for s in samples if s.ts <= end]
+
+    points = [tl.TimelinePoint(ts=s.ts, temperature=s.temperature, humidity=s.humidity)
+              for s in samples]
+    n = len(points)
+    forced: dict[int, set[str]] = {}
+
+    def mark(i: int, reason: str) -> None:
+        forced.setdefault(i, set()).add(reason)
+
+    if n:
+        # 范围首尾（samples 已按 ts 升序）
+        mark(0, tl.REASON_RANGE_START)
+        mark(n - 1, tl.REASON_RANGE_END)
+
+        # 温/湿度全局极值；并列时取最早出现（升序扫描 + 严格不等号）
+        tmin_i = tmax_i = hmin_i = hmax_i = 0
+        for i in range(1, n):
+            if points[i].temperature < points[tmin_i].temperature:
+                tmin_i = i
+            if points[i].temperature > points[tmax_i].temperature:
+                tmax_i = i
+            if points[i].humidity < points[hmin_i].humidity:
+                hmin_i = i
+            if points[i].humidity > points[hmax_i].humidity:
+                hmax_i = i
+        mark(tmin_i, tl.REASON_TEMP_MIN)
+        mark(tmax_i, tl.REASON_TEMP_MAX)
+        mark(hmin_i, tl.REASON_HUMIDITY_MIN)
+        mark(hmax_i, tl.REASON_HUMIDITY_MAX)
+
+        segmentation = get_effective_segmentation(db, device_sn)
+        assert segmentation is not None  # 有读数则必有分段结果
+
+        ts_index = {p.ts: i for i, p in enumerate(points)}
+
+        # 已对齐锚点所在读数（ts_index 已只含过滤后范围，天然受窗口约束）
+        for a in list_anchors(db, device_sn):
+            if a["aligned"] is True and a["aligned_ts"] in ts_index:
+                mark(ts_index[a["aligned_ts"]], tl.REASON_ALIGNED_ANCHOR)
+
+        # 过滤后仍与范围相交的分段，其两端读数作为分段边界
+        for s in segmentation.segments:
+            if start is not None and s.end_ts < start:
+                continue
+            if end is not None and s.start_ts > end:
+                continue
+            if s.start_ts in ts_index:
+                mark(ts_index[s.start_ts], tl.REASON_SEGMENT_BOUNDARY)
+            if s.end_ts in ts_index:
+                mark(ts_index[s.end_ts], tl.REASON_SEGMENT_BOUNDARY)
+
+    chosen = tl.downsample_timeline(points, forced, max_points)
+    return TimelineOut(
+        device_sn=device_sn,
+        start=start,
+        end=end,
+        max_points=max_points,
+        original_count=n,
+        returned_count=len(chosen),
+        points=[
+            TimelinePointOut(
+                ts=points[i].ts,
+                temperature=points[i].temperature,
+                humidity=points[i].humidity,
+                reasons=reasons,
+            )
+            for i, reasons in chosen
+        ],
+    )
 
 
 def affected_window(

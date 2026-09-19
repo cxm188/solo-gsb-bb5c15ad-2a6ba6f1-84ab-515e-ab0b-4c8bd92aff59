@@ -466,3 +466,221 @@ def test_preview_duplicate_merge_respects_report_count(client, db):
     assert row.report_count == 2
     assert row.temperature == pytest.approx(21.0)
     assert row.humidity == pytest.approx(52.0)
+
+
+# ---------- 时间线降采样 ----------
+
+
+def _timeline_payload(sn, n=12):
+    """带明显跳变、独立温湿度极值的 12 点序列（每 5 分钟一点）。"""
+    return [
+        _reading(
+            sn,
+            f"2026-09-01T08:{i * 5:02d}:00+08:00",
+            20.0
+            + (4.0 if 6 <= i <= 8 else 0.0)
+            + (0.3 if i == 3 else 0.0)
+            - (0.5 if i == n - 1 else 0.0),
+            55.0 + (20.0 if i == 9 else 0.0) - (10.0 if i == 2 else 0.0),
+        )
+        for i in range(n)
+    ]
+
+
+def test_timeline_returns_all_when_budget_allows(client):
+    client.post(
+        "/api/v1/readings/batch", json={"readings": _timeline_payload("CASE-T0")}
+    )
+    r = client.get("/api/v1/cases/CASE-T0/timeline", params={"max_points": 50})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["original_count"] == 12
+    assert body["returned_count"] == 12
+    assert body["max_points"] == 50
+    ts = [p["ts"] for p in body["points"]]
+    assert ts == sorted(ts)
+    assert body["start"] is None and body["end"] is None
+
+
+def test_timeline_forced_points_and_lttb(client):
+    client.post(
+        "/api/v1/readings/batch", json={"readings": _timeline_payload("CASE-T1")}
+    )
+    client.post(
+        "/api/v1/anchors",
+        json={"device_sn": "CASE-T1", "ts": "2026-09-01T08:20:00+08:00"},
+    )
+    r = client.get("/api/v1/cases/CASE-T1/timeline", params={"max_points": 10})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["original_count"] == 12
+    assert body["returned_count"] == 10
+
+    by_ts = {p["ts"]: p for p in body["points"]}
+    first = body["points"][0]
+    last = body["points"][-1]
+    assert "range_start" in first["reasons"]
+    assert "range_end" in last["reasons"]
+    # 已对齐锚点（00:20 UTC = 08:20+08）
+    assert "aligned_anchor" in by_ts["2026-09-01T00:20:00Z"]["reasons"]
+    # 温湿度极值
+    reasons_all = {x for p in body["points"] for x in p["reasons"]}
+    for reason in (
+        "temp_min",
+        "temp_max",
+        "humidity_min",
+        "humidity_max",
+        "segment_boundary",
+        "lttb",
+    ):
+        assert reason in reasons_all
+    # 每点原因按固定顺序、去重
+    for p in body["points"]:
+        assert p["reasons"] == sorted(set(p["reasons"]), key=p["reasons"].index)
+
+
+def test_timeline_422_when_forced_points_exceed_budget(client):
+    payload = [
+        _reading("CASE-T2", f"2026-09-01T08:{i * 5:02d}:00+08:00", 20.0, 55.0)
+        for i in range(8)
+    ]
+    client.post("/api/v1/readings/batch", json={"readings": payload})
+    # 在每个读数上登记对齐锚点 → 8 个去重强制点
+    for i in range(8):
+        client.post(
+            "/api/v1/anchors",
+            json={
+                "device_sn": "CASE-T2",
+                "ts": f"2026-09-01T08:{i * 5:02d}:00+08:00",
+            },
+        )
+
+    r = client.get("/api/v1/cases/CASE-T2/timeline", params={"max_points": 5})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["minimum_required"] == 8
+    assert detail["max_points"] == 5
+
+    # 达到下限时必须全量返回，不得静默丢点
+    r = client.get("/api/v1/cases/CASE-T2/timeline", params={"max_points": 8})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["returned_count"] == 8
+    assert body["original_count"] == 8
+
+
+def test_timeline_start_end_filter_scopes_extremes_and_budget(client):
+    client.post(
+        "/api/v1/readings/batch", json={"readings": _timeline_payload("CASE-T3")}
+    )
+    client.post(
+        "/api/v1/anchors",
+        json={"device_sn": "CASE-T3", "ts": "2026-09-01T08:20:00+08:00"},
+    )
+    r = client.get(
+        "/api/v1/cases/CASE-T3/timeline",
+        params={
+            "max_points": 50,
+            "start": "2026-09-01T08:00:00+08:00",
+            "end": "2026-09-01T08:15:00+08:00",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["original_count"] == 4  # 00,05,10,15 UTC
+    assert body["returned_count"] == 4
+    assert body["start"].startswith("2026-09-01T00:00:00")
+    assert body["end"].startswith("2026-09-01T00:15:00")
+    ts_list = [p["ts"] for p in body["points"]]
+    assert ts_list[0] == "2026-09-01T00:00:00Z"
+    assert ts_list[-1] == "2026-09-01T00:15:00Z"
+    # 窗口外的锚点/分段边界与极值不参与强制点
+    reasons_all = {x for p in body["points"] for x in p["reasons"]}
+    assert "aligned_anchor" not in reasons_all
+    # 窗口内首点湿度 55、次点 45 才是窗口湿度极小（全局湿度极小在窗口外）
+    hum_min_point = next(
+        p for p in body["points"] if "humidity_min" in p["reasons"]
+    )
+    assert hum_min_point["humidity"] == 45.0
+
+
+def test_timeline_empty_range_returns_empty_array(client):
+    client.post(
+        "/api/v1/readings/batch", json={"readings": _timeline_payload("CASE-T4")}
+    )
+    r = client.get(
+        "/api/v1/cases/CASE-T4/timeline",
+        params={
+            "max_points": 10,
+            "start": "2030-01-01T00:00:00Z",
+            "end": "2030-02-01T00:00:00Z",
+        },
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["points"] == []
+    assert body["original_count"] == 0
+    assert body["returned_count"] == 0
+
+
+def test_timeline_unknown_case_404(client):
+    r = client.get("/api/v1/cases/NOPE/timeline", params={"max_points": 10})
+    assert r.status_code == 404
+
+
+def test_timeline_validation_errors(client):
+    client.post(
+        "/api/v1/readings/batch", json={"readings": _timeline_payload("CASE-T5")}
+    )
+    # max_points 必填、且 >= 1
+    assert client.get("/api/v1/cases/CASE-T5/timeline").status_code == 422
+    assert (
+        client.get("/api/v1/cases/CASE-T5/timeline", params={"max_points": 0}).status_code
+        == 422
+    )
+    # start 晚于 end
+    assert (
+        client.get(
+            "/api/v1/cases/CASE-T5/timeline",
+            params={
+                "max_points": 10,
+                "start": "2030-01-01T00:00:00Z",
+                "end": "2029-01-01T00:00:00Z",
+            },
+        ).status_code
+        == 422
+    )
+
+
+def test_timeline_deterministic(client):
+    client.post(
+        "/api/v1/readings/batch", json={"readings": _timeline_payload("CASE-T6")}
+    )
+    client.post(
+        "/api/v1/anchors",
+        json={"device_sn": "CASE-T6", "ts": "2026-09-01T08:25:00+08:00"},
+    )
+    params = {"max_points": 9}
+    first = client.get("/api/v1/cases/CASE-T6/timeline", params=params).json()
+    second = client.get("/api/v1/cases/CASE-T6/timeline", params=params).json()
+    assert first == second
+    # 独立乱序重放后结果仍一致
+    shuffled = _timeline_payload("CASE-T6")[::-1]
+    client.post("/api/v1/readings/batch", json={"readings": shuffled})
+    third = client.get("/api/v1/cases/CASE-T6/timeline", params=params).json()
+    assert [(p["ts"], p["reasons"]) for p in third["points"]] == [
+        (p["ts"], p["reasons"]) for p in first["points"]
+    ]
+
+
+def test_timeline_without_prior_replay_uses_on_demand_segmentation(client):
+    # 关闭自动重放：落库但没有分段快照，timeline 仍应即时计算分段边界
+    r = client.post(
+        "/api/v1/readings/batch",
+        json={"readings": _timeline_payload("CASE-T7"), "replay": False},
+    )
+    assert r.status_code == 200
+    r = client.get("/api/v1/cases/CASE-T7/timeline", params={"max_points": 10})
+    assert r.status_code == 200, r.text
+    reasons_all = {x for p in r.json()["points"] for x in p["reasons"]}
+    assert "segment_boundary" in reasons_all

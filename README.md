@@ -96,6 +96,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | POST | `/api/v1/readings/batch` | 批量上报，自动合并重复并重放受影响展柜 |
 | GET  | `/api/v1/cases` | 展柜列表（版本、读数/锚点数） |
 | GET  | `/api/v1/cases/{sn}/segments` | 查询分段，支持 `start` / `end` 时间过滤 |
+| GET  | `/api/v1/cases/{sn}/timeline?max_points=...` | 时间线降采样读数，支持 `start` / `end` 时间过滤 |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
 | GET  | `/api/v1/cases/{sn}/anchors` | 查询锚点及对齐情况 |
 | DELETE | `/api/v1/cases/{sn}/anchors/{ts}` | 删除锚点并重放 |
@@ -142,6 +143,58 @@ curl -X POST 'http://localhost:8080/api/v1/replay/preview?device_sn=CASE-007' \
 返回 `changed`、`would_bump_version`、受影响时间范围，以及 `preview` / `current`
 两份分段；执行后再查读数数量与版本号均不会变化。
 
+### 时间线降采样
+
+```bash
+curl 'http://localhost:8080/api/v1/cases/CASE-007/timeline?max_points=200&start=2026-09-01T00:00:00Z&end=2026-09-02T00:00:00Z'
+```
+
+返回按时间升序排列的温湿度读数，在不超过 `max_points` 的前提下做确定性降采样：
+
+1. **强制点**（去重，一个点可同时命中多条原因，原因随该点返回）：
+   - 过滤后范围的**首点、尾点**（`range_start` / `range_end`）；
+   - 范围内**温度、湿度各自的全局极小/极大值**（`temp_min` / `temp_max` /
+     `humidity_min` / `humidity_max`，并列取最早出现）；
+   - **已对齐锚点**所在读数（`aligned_anchor`）；
+   - **分段边界**所在读数（`segment_boundary`，分段取自已落库快照，
+     尚未重放的展柜即时只读计算）。
+2. 强制点去重后若**已超过** `max_points`，接口返回 `422` 并在响应体给出
+   `minimum_required`，**绝不静默丢点**；把 `max_points` 调到该值以上即可取全。
+3. 其余名额按**相邻强制点区间内候选点数比例**分配（最大余数法），余数按分数
+   降序派发，分数相同则**区间起始时间更早者优先**（稳定分派）。
+4. 各区间在两个强制端点之间独立做**确定性 LTTB**（温、湿度两个量纲的三角形
+   面积之和，全部并列取下标最小者）；区间配额不小于候选数时候选点全部保留，
+   这些点标记为 `lttb`。
+
+`start` / `end` 均为含端点的 ISO8601 过滤；**极值统计与名额预算都只基于过滤后
+范围**。过滤后为空范围时返回 `200` 与空数组；设备没有任何读数时返回 `404`。
+
+响应示例（节选）：
+
+```json
+{
+  "device_sn": "CASE-007",
+  "start": "2026-09-01T00:00:00Z",
+  "end": "2026-09-02T00:00:00Z",
+  "max_points": 200,
+  "original_count": 1440,
+  "returned_count": 200,
+  "points": [
+    {"ts": "2026-09-01T00:00:00Z", "temperature": 20.1, "humidity": 55.0,
+     "reasons": ["range_start", "segment_boundary"]},
+    {"ts": "2026-09-01T00:07:00Z", "temperature": 28.4, "humidity": 72.6,
+     "reasons": ["temp_max"]}
+  ]
+}
+```
+
+强制点超预算时的 `422` 响应：
+
+```json
+{"detail": {"message": "强制保留点 8 个，已超过 max_points=5",
+            "minimum_required": 8, "max_points": 5}}
+```
+
 ---
 
 ## 配置（环境变量）
@@ -169,5 +222,7 @@ python -m pytest -q
 ```
 
 测试覆盖：变点检出与置信标记、惩罚项单调性、确定性、重复合并、迟到重放、
-锚点强制边界、时间范围查询以及**预览不写库**（含待预览读数与库内重复、
-请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例）。
+锚点强制边界、时间范围查询、**预览不写库**（含待预览读数与库内重复、
+请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例），以及
+**时间线降采样**（比例配额与余数稳定分派、强制点去重超预算返回 422 与
+`minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算）。

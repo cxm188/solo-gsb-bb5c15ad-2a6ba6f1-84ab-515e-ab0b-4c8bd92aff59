@@ -23,8 +23,10 @@ from .schemas import (
     ReadingIn,
     ReplayPreviewResponse,
     SegmentationOut,
+    TimelineOut,
 )
 from .segmentation import Sample, segment_samples
+from .timeline import ForcedPointsOverflow
 
 
 class PreviewBody(BaseModel):
@@ -161,15 +163,9 @@ def get_segments(
     end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
     db: Session = Depends(get_db),
 ):
-    stored = services.get_stored_segmentation(db, device_sn)
+    stored = services.get_effective_segmentation(db, device_sn)
     if stored is None:
-        # 允许对尚未重放的展柜即时计算（只读，不落库）
-        samples = services._load_samples(db, device_sn)
-        if not samples:
-            raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
-        anchors = services._load_anchor_ts(db, device_sn)
-        result = segment_samples(device_sn, samples, anchors)
-        stored = services.serialize_result(result, version=0, replayed=False, replayed_at=None)
+        raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
 
     start_utc = _parse_ts(start)
     end_utc = _parse_ts(end)
@@ -181,6 +177,47 @@ def get_segments(
         kept = [s for s in stored.segments if s.end_ts >= lo and s.start_ts <= hi]
         stored = stored.model_copy(update={"segments": kept})
     return stored
+
+
+@app.get(
+    "/api/v1/cases/{device_sn}/timeline",
+    response_model=TimelineOut,
+    tags=["cases"],
+    summary="查询时间线降采样读数（强制点 + 比例配额 + 确定性 LTTB）",
+)
+def get_timeline(
+    device_sn: str,
+    max_points: int = Query(
+        ...,
+        ge=1,
+        le=1_000_000,
+        description="返回点数上限；强制保留点超过该值时返回 422",
+    ),
+    start: dt.datetime | None = Query(None, description="起始时间（含），ISO8601"),
+    end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
+    db: Session = Depends(get_db),
+):
+    start_utc = _parse_ts(start)
+    end_utc = _parse_ts(end)
+    if start_utc is not None and end_utc is not None and start_utc > end_utc:
+        raise HTTPException(status_code=422, detail="start 不能晚于 end")
+
+    try:
+        timeline = services.build_case_timeline(
+            db, device_sn, start_utc, end_utc, max_points
+        )
+    except ForcedPointsOverflow as exc:
+        detail = {
+            "message": str(exc),
+            "minimum_required": int(exc.minimum_required),
+            "max_points": exc.max_points,
+        }
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail
+        )
+    if timeline is None:
+        raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
+    return timeline
 
 
 # ---------- 锚点校准 ----------
