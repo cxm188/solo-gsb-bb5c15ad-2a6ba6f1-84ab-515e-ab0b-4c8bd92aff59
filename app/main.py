@@ -10,7 +10,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from . import services
+from . import services, timeline
 from .database import CaseState, SessionLocal, init_db, to_utc
 from .schemas import (
     AnchorIn,
@@ -23,8 +23,11 @@ from .schemas import (
     ReadingIn,
     ReplayPreviewResponse,
     SegmentationOut,
+    TimelineOut,
+    TimelinePointOut,
 )
 from .segmentation import Sample, segment_samples
+from .timeline import REASON_ORDER, build_forced, downsample
 
 
 class PreviewBody(BaseModel):
@@ -161,15 +164,9 @@ def get_segments(
     end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
     db: Session = Depends(get_db),
 ):
-    stored = services.get_stored_segmentation(db, device_sn)
+    stored = services._get_or_compute_segmentation(db, device_sn)
     if stored is None:
-        # 允许对尚未重放的展柜即时计算（只读，不落库）
-        samples = services._load_samples(db, device_sn)
-        if not samples:
-            raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
-        anchors = services._load_anchor_ts(db, device_sn)
-        result = segment_samples(device_sn, samples, anchors)
-        stored = services.serialize_result(result, version=0, replayed=False, replayed_at=None)
+        raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
 
     start_utc = _parse_ts(start)
     end_utc = _parse_ts(end)
@@ -181,6 +178,82 @@ def get_segments(
         kept = [s for s in stored.segments if s.end_ts >= lo and s.start_ts <= hi]
         stored = stored.model_copy(update={"segments": kept})
     return stored
+
+
+@app.get(
+    "/api/v1/cases/{device_sn}/timeline",
+    response_model=TimelineOut,
+    tags=["cases"],
+    summary="查询时间线降采样读数（强制保留首尾/极值/锚点/分段边界，其余 LTTB）",
+)
+def get_timeline(
+    device_sn: str,
+    max_points: int = Query(
+        500, ge=1, le=1_000_000, description="最多返回的读数点数（含强制点）"
+    ),
+    start: dt.datetime | None = Query(None, description="起始时间（含），ISO8601；极值与预算均基于过滤后范围"),
+    end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
+    db: Session = Depends(get_db),
+):
+    start_utc = _parse_ts(start)
+    end_utc = _parse_ts(end)
+    if start_utc and end_utc and start_utc > end_utc:
+        raise HTTPException(status_code=422, detail="start 不能晚于 end")
+
+    context = services.load_timeline_context(db, device_sn, start_utc, end_utc)
+    if context is None:
+        raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
+
+    samples, boundary_ts, aligned_ts = context
+    original_count = len(samples)
+
+    if original_count == 0:
+        return TimelineOut(
+            device_sn=device_sn,
+            start=start_utc,
+            end=end_utc,
+            max_points=max_points,
+            original_count=0,
+            returned_count=0,
+            points=[],
+        )
+
+    forced = build_forced(samples, boundary_ts=boundary_ts, aligned_anchor_ts=aligned_ts)
+    try:
+        selected = downsample(samples, forced, max_points)
+    except timeline.RequiredPointsExceedBudget as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "minimum_required": exc.required,
+                "max_points": exc.max_points,
+            },
+        )
+
+    points: list[TimelinePointOut] = []
+    for i in sorted(selected):
+        s = samples[i]
+        reasons = [r for r in REASON_ORDER if r in selected[i]]
+        points.append(
+            TimelinePointOut(
+                ts=s.ts,
+                temperature=s.temperature,
+                humidity=s.humidity,
+                report_count=s.report_count,
+                reasons=reasons,
+            )
+        )
+
+    return TimelineOut(
+        device_sn=device_sn,
+        start=start_utc,
+        end=end_utc,
+        max_points=max_points,
+        original_count=original_count,
+        returned_count=len(points),
+        points=points,
+    )
 
 
 # ---------- 锚点校准 ----------

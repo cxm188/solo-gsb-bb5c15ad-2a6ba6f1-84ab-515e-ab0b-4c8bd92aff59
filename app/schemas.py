@@ -129,6 +129,32 @@ class ReplayPreviewResponse(BaseModel):
     current: "SegmentationOut | None" = None
 
 
+class TimelinePointOut(BaseModel):
+    ts: dt.datetime
+    temperature: float
+    humidity: float
+    report_count: int
+    reasons: list[str] = Field(
+        ...,
+        description=(
+            "该点被保留的原因（按规范顺序排列）：range_start/range_end 首尾、"
+            "temperature_max/min、humidity_max/min 全局极值、"
+            "aligned_anchor 已对齐锚点、segment_boundary 分段边界、"
+            "lttb 区间 LTTB 选点"
+        ),
+    )
+
+
+class TimelineOut(BaseModel):
+    device_sn: str
+    start: dt.datetime | None = Field(None, description="本次过滤使用的起始时间（含），UTC")
+    end: dt.datetime | None = Field(None, description="本次过滤使用的结束时间（含），UTC")
+    max_points: int
+    original_count: int = Field(..., description="过滤后范围内的原始读数数量")
+    returned_count: int
+    points: list[TimelinePointOut]
+
+
 class HealthOut(BaseModel):
     status: str
     db: str

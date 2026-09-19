@@ -129,6 +129,21 @@ def _snapshot_to_out(r: SegmentSnapshot, i: int) -> SegmentOut:
     )
 
 
+def _get_or_compute_segmentation(
+    db: Session, device_sn: str
+) -> SegmentationOut | None:
+    """返回已存储分段；展柜尚无快照但已有读数时即时计算（只读，不落库）。"""
+    stored = get_stored_segmentation(db, device_sn)
+    if stored is not None:
+        return stored
+    samples = _load_samples(db, device_sn)
+    if not samples:
+        return None
+    anchors = _load_anchor_ts(db, device_sn)
+    result = seg.segment_samples(device_sn, samples, anchors)
+    return serialize_result(result, version=0, replayed=False, replayed_at=None)
+
+
 def _count_anchors(db: Session, device_sn: str) -> int:
     return int(
         db.scalar(select(func.count(Anchor.id)).where(Anchor.device_sn == device_sn)) or 0
@@ -333,6 +348,44 @@ def delete_anchor(db: Session, device_sn: str, ts: dt.datetime) -> bool:
 
 def list_cases(db: Session) -> list[CaseState]:
     return list(db.scalars(select(CaseState).order_by(CaseState.device_sn.asc())).all())
+
+
+def load_timeline_context(
+    db: Session,
+    device_sn: str,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> tuple[list[seg.Sample], set[dt.datetime], set[dt.datetime]] | None:
+    """加载时间线降采样所需上下文。
+
+    返回 ``(过滤后的有序读数, 分段边界时间戳集合, 已对齐锚点读数时间戳集合)``；
+    设备不存在（无任何读数）时返回 ``None``。极值与强制点均以过滤后的
+    读数为准。分段边界/锚点若落在过滤范围外，会在降采样模块按时间戳
+    匹配时自然被忽略。
+    """
+    samples = _load_samples(db, device_sn)
+    if not samples:
+        return None
+
+    if start is not None or end is not None:
+        lo = start or dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+        hi = end or dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+        samples = [s for s in samples if lo <= s.ts <= hi]
+
+    segmentation = _get_or_compute_segmentation(db, device_sn)
+    boundary_ts: set[dt.datetime] = set()
+    if segmentation is not None:
+        boundary_ts = {seg.start_ts for seg in segmentation.segments}
+
+    aligned_ts: set[dt.datetime] = set()
+    anchor_rows = db.scalars(
+        select(Anchor).where(Anchor.device_sn == device_sn)
+    ).all()
+    for a in anchor_rows:
+        if a.reading is not None:
+            aligned_ts.add(to_utc(a.reading.ts))
+
+    return samples, boundary_ts, aligned_ts
 
 
 def affected_window(

@@ -79,7 +79,28 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 对齐成功即成为强制边界且该变点标记为 `high`。锚点先于读数登记时保持
 `aligned=false`，读数补入并重放后自动纳入。
 
-### 5. 重放预览（绝不写库）
+### 5. 时间线降采样（强制点 + 确定性 LTTB）
+
+`GET /api/v1/cases/{sn}/timeline?max_points=...&start=...&end=...`
+返回按时间排序的温湿度读数，在**不超过 `max_points`**（默认 500）的前提下：
+
+- **强制保留**（去重后一个都不丢）：过滤范围内的**首、尾点**，温度与湿度的
+  **全局最大/最小值点**（并列取最早），**已对齐锚点**落在的读数，以及每个
+  **分段的起始边界点**；
+- 剩余名额在相邻强制点之间的区间上，按各区间**候选点数比例**分配
+  （最大余数法；余数相同时按区间**起始时间升序**稳定分派）；
+- 每个区间内部用**确定性 LTTB**（最大三角桶，温湿度各自量纲缩放后取面积合成，
+  面积并列取更早点）选点；
+- `start/end` 为含端点的时间过滤；**极值与预算都只基于过滤后的范围**；
+  范围内没有读数时返回空数组；
+- 去重后的强制点仍超过 `max_points` 时返回 **422** 并给出
+  `detail.minimum_required`，**绝不静默丢点**。
+
+响应含 `original_count`（过滤后原始点数）、`returned_count` 与每点的
+`reasons`（保留原因：`range_start/range_end`、`temperature_max/min`、
+`humidity_max/min`、`aligned_anchor`、`segment_boundary`、`lttb`）。
+
+### 6. 重放预览（绝不写库）
 
 `POST /api/v1/replay/preview` 把**库内已有数据 + 本次待补入读数/锚点**在内存中
 合并试算，返回“预览分段 + 当前分段”的差异对比。待预览读数与库内同时间戳、
@@ -96,6 +117,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | POST | `/api/v1/readings/batch` | 批量上报，自动合并重复并重放受影响展柜 |
 | GET  | `/api/v1/cases` | 展柜列表（版本、读数/锚点数） |
 | GET  | `/api/v1/cases/{sn}/segments` | 查询分段，支持 `start` / `end` 时间过滤 |
+| GET  | `/api/v1/cases/{sn}/timeline` | 时间线降采样读数，支持 `max_points`、`start` / `end` |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
 | GET  | `/api/v1/cases/{sn}/anchors` | 查询锚点及对齐情况 |
 | DELETE | `/api/v1/cases/{sn}/anchors/{ts}` | 删除锚点并重放 |
@@ -127,6 +149,49 @@ curl -X POST http://localhost:8080/api/v1/anchors \
   -d '{"device_sn": "CASE-007", "ts": "2026-09-01T09:00:00+08:00",
        "label": "更换调湿剂", "ref_temperature": 21.0, "ref_humidity": 60.0}'
 ```
+
+### 时间线降采样
+
+```bash
+# 最多返回 200 个点；首尾/温湿度极值/锚点/分段边界强制保留，其余按区间 LTTB
+curl 'http://localhost:8080/api/v1/cases/CASE-007/timeline?max_points=200'
+
+# 仅取某时间窗（含端点）；极值与名额预算均基于过滤后的范围
+curl 'http://localhost:8080/api/v1/cases/CASE-007/timeline?max_points=100&start=2026-09-01T00:00:00Z&end=2026-09-02T00:00:00Z'
+```
+
+```json
+{
+  "device_sn": "CASE-007",
+  "start": null,
+  "end": null,
+  "max_points": 200,
+  "original_count": 2880,
+  "returned_count": 200,
+  "points": [
+    {"ts": "2026-09-01T00:00:00Z", "temperature": 20.1, "humidity": 55.0,
+     "report_count": 1, "reasons": ["range_start", "temperature_min", "humidity_min"]},
+    {"ts": "2026-09-01T01:30:00Z", "temperature": 20.4, "humidity": 55.2,
+     "report_count": 1, "reasons": ["aligned_anchor", "segment_boundary"]},
+    {"ts": "2026-09-01T08:20:00Z", "temperature": 24.9, "humidity": 70.2,
+     "report_count": 1, "reasons": ["temperature_max", "humidity_max", "lttb"]},
+    {"ts": "2026-09-30T23:50:00Z", "temperature": 20.6, "humidity": 55.8,
+     "report_count": 1, "reasons": ["lttb"]},
+    {"ts": "2026-09-30T23:59:00Z", "temperature": 20.5, "humidity": 55.9,
+     "report_count": 1, "reasons": ["range_end"]}
+  ]
+}
+```
+
+当强制点数量超过预算（例如 `max_points=100` 但仅去重后的强制点就有 132 个），
+返回 `422`：
+
+```json
+{"detail": {"message": "强制保留点去重后为 132 个，超过 max_points=100",
+            "minimum_required": 132, "max_points": 100}}
+```
+
+过滤范围内无读数时返回 `200` 且 `points` 为空数组、`original_count` 为 0。
 
 ### 迟到读数预览（不写库）
 
@@ -169,5 +234,7 @@ python -m pytest -q
 ```
 
 测试覆盖：变点检出与置信标记、惩罚项单调性、确定性、重复合并、迟到重放、
-锚点强制边界、时间范围查询以及**预览不写库**（含待预览读数与库内重复、
+锚点强制边界、时间范围查询、**时间线降采样**（强制点保留与 422
+`minimum_required`、区间比例配额与余数稳定分派、确定性 LTTB、过滤范围基准）
+以及**预览不写库**（含待预览读数与库内重复、
 请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例）。
